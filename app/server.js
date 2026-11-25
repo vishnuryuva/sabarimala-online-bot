@@ -3,7 +3,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const bot = require('./e2e/bot');
+const { createBot } = require('./e2e/bot');
 
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '127.0.0.1';
@@ -21,9 +21,24 @@ if (APP_PASSWORD && Buffer.byteLength(APP_PASSWORD, 'utf8') < 16) {
 const REL = { father: 1, mother: 1, son: 1, daughter: 1, brother: 1, sister: 1, spouse: 1 };
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
-let running = false;
-let logs = [];
+// Any number of fully independent bots, added from the page. Each has its own name, config, status,
+// console log and its own isolated browser session (all sharing one Chromium, see e2e/bot.js).
+const bots = {};
+const cleanName = (name, id) => String(name || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 40) || `Bot ${id}`;
+function ensureBot(id, name) {
+    if (!bots[id]) {
+        bots[id] = { id, name: cleanName(name, id), running: false, logs: [], progress: null, username: '', runner: createBot(id) };
+    } else if (name) {
+        bots[id].name = cleanName(name, id);
+    }
+    return bots[id];
+}
+ensureBot(1); // the page always starts with one bot
 const clients = new Set();
+
+// The bots must never crash the server, whatever a browser or the website does.
+process.on('uncaughtException', (e) => console.error('Uncaught exception (ignored):', e && e.stack || e));
+process.on('unhandledRejection', (e) => console.error('Unhandled rejection (ignored):', e && e.stack || e));
 
 function safeEqual(actual, expected) {
     const actualBuffer = Buffer.from(actual, 'utf8');
@@ -45,10 +60,42 @@ function isAuthorized(req) {
         && safeEqual(credentials.slice(separator + 1), APP_PASSWORD);
 }
 
-function emit(type, data) {
-    const line = JSON.stringify({ type, data });
-    if (type === 'log') { logs.push(data); if (logs.length > 2000) logs.shift(); }
+const pad = (n) => String(n).padStart(2, '0');
+function stamp(text) {
+    const d = new Date();
+    const t = `[${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}] `;
+    return String(text).replace(/^(\n*)/, `$1${t}`);
+}
+
+function emit(botId, type, data) {
+    if (type === 'progress' && bots[botId]) bots[botId].progress = data;
+    if (type === 'log' && bots[botId]) {
+        data = stamp(data);
+        const b = bots[botId];
+        b.logs.push(data);
+        if (b.logs.length > 2000) b.logs.shift();
+    }
+    const line = JSON.stringify({ bot: botId, type, data });
     for (const c of clients) c.write(`data: ${line}\n\n`);
+}
+
+function startBot(botId, cfg) {
+    const b = bots[botId];
+    b.running = true; b.logs = []; b.progress = null; b.username = cfg.username;
+    emit(botId, 'status', { running: true });
+    for (const other of Object.values(bots)) {
+        if (other.id !== botId && other.running && other.username === cfg.username) {
+            emit(botId, 'log', `⚠️ "${other.name}" is running with the SAME account. The wishlist belongs to the account, so the two bots can clear each other's wishlist. Use a different account per bot.`);
+        }
+    }
+    b.runner.run(cfg, (line) => emit(botId, 'log', line), (prog) => emit(botId, 'progress', prog))
+        .catch((e) => emit(botId, 'log', `🛑 ${e.message}`))
+        .finally(() => { b.running = false; emit(botId, 'status', { running: false }); });
+}
+
+function stopBot(botId) {
+    const b = bots[botId];
+    if (b.running) { emit(botId, 'log', '⏹ Stop requested...'); b.runner.stop(); }
 }
 
 function validate(b) {
@@ -81,7 +128,9 @@ function validate(b) {
         nominee: { name: (b.nominee || {}).name, age: String((b.nominee || {}).age), relation: (b.nominee || {}).relation },
         overrides, slotMode: b.slotMode === 'particular' ? 'particular' : 'auto', slots,
         routeValue: String(b.routeValue || '1'),
-        maxFailures: Math.max(1, +b.maxFailures || 20), retryDelaySec: Math.max(1, +b.retryDelaySec || 5),
+        maxRetries: Math.min(100, Math.max(1, Math.floor(+b.maxRetries) || 5)),
+        retryDelaySec: Math.max(1, +b.retryDelaySec || 5),
+        cooldownSec: Math.max(1, +b.cooldownSec || 60),
         headless: b.headless !== false, useInstalledChrome: !!b.useInstalledChrome,
     } };
 }
@@ -100,29 +149,68 @@ http.createServer(async (req, res) => {
         return res.end('Authentication required.');
     }
 
-    if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    const url = String(req.url || '').split('?')[0];
+
+    if (req.method === 'GET' && (url === '/' || url === '/index.html')) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
         return res.end(fs.readFileSync(path.join(__dirname, 'public', 'index.html')));
     }
-    if (req.url === '/api/events') {
+    if (url === '/api/events') {
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-        res.write(`data: ${JSON.stringify({ type: 'init', data: { running, logs } })}\n\n`);
+        const init = {};
+        for (const b of Object.values(bots)) init[b.id] = { name: b.name, running: b.running, logs: b.logs, progress: b.progress };
+        res.write(`data: ${JSON.stringify({ type: 'init', data: { bots: init } })}\n\n`);
         clients.add(res);
         return req.on('close', () => clients.delete(res));
     }
-    if (req.method === 'POST' && req.url === '/api/start') {
-        if (running) return json(res, 409, { errors: ['Automation is already running.'] });
-        const { err, cfg } = validate(await readBody(req));
-        if (err.length) return json(res, 400, { errors: err });
-        running = true; logs = []; emit('status', { running: true });
-        bot.run(cfg, (line) => emit('log', line))
-            .catch((e) => emit('log', `🛑 ${e.message}`))
-            .finally(() => { running = false; emit('status', { running: false }); });
+
+    // POST /api/bots {id?, name}      add a bot (the page picks the id and the name)
+    if (req.method === 'POST' && url === '/api/bots') {
+        const body = await readBody(req);
+        let id = parseInt(body.id, 10);
+        if (!Number.isInteger(id) || id < 1) id = Math.max(0, ...Object.keys(bots).map(Number)) + 1;
+        const existed = !!bots[id];
+        const b = ensureBot(id, body.name);
+        if (!existed) emit(id, 'bot-added', { name: b.name });
+        return json(res, 200, { ok: true, id, name: b.name });
+    }
+    // POST /api/bots/<id>/name {name}   rename a bot      DELETE /api/bots/<id>   remove a bot (when idle)
+    const nm = /^\/api\/bots\/(\d+)(?:\/(name))?$/.exec(url);
+    if (nm && req.method === 'POST' && nm[2] === 'name') {
+        const id = parseInt(nm[1], 10);
+        const b = ensureBot(id, (await readBody(req)).name);
+        emit(id, 'bot-name', { name: b.name });
+        return json(res, 200, { ok: true, name: b.name });
+    }
+    if (nm && req.method === 'DELETE' && !nm[2]) {
+        const id = parseInt(nm[1], 10);
+        if (bots[id] && bots[id].running) return json(res, 409, { errors: [`"${bots[id].name}" is running. Stop it first.`] });
+        if (bots[id]) { emit(id, 'bot-removed', {}); delete bots[id]; }
         return json(res, 200, { ok: true });
     }
-    if (req.method === 'POST' && req.url === '/api/stop') {
-        if (running) { emit('log', '⏹ Stop requested...'); bot.stop(); }
+
+    // POST /api/bots/<id>/start | /api/bots/<id>/stop   (/api/stop alone stops every bot)
+    const m = /^\/api\/(?:bots\/(\d+)\/)?(start|stop)$/.exec(url);
+    if (req.method === 'POST' && m) {
+        const action = m[2];
+        if (!m[1] && action === 'stop') {
+            Object.keys(bots).forEach((id) => stopBot(+id));
+            return json(res, 200, { ok: true });
+        }
+        const botId = m[1] ? parseInt(m[1], 10) : 1;
+
+        if (action === 'stop') {
+            if (bots[botId]) stopBot(botId);
+            return json(res, 200, { ok: true });
+        }
+        const body = await readBody(req);
+        // A bot the page knows about but the server does not (e.g. after a server restart) is created here.
+        const bot = ensureBot(botId, body.name);
+        if (bot.running) return json(res, 409, { errors: [`"${bot.name}" is already running.`] });
+        const { err, cfg } = validate(body);
+        if (err.length) return json(res, 400, { errors: err });
+        startBot(botId, cfg);
         return json(res, 200, { ok: true });
     }
     res.writeHead(404); res.end('Not found');
-}).listen(PORT, HOST, () => console.log(`Open http://localhost:${PORT}`));
+}).listen(PORT, HOST, () => console.log(`Open http://localhost:${PORT}  (add as many bots as you need with "+ Add bot")`));
