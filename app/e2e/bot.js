@@ -416,7 +416,10 @@ function createBot(botId) {
         let skipped = [];
         let retryingSkipped = false;        // true while the previously skipped pilgrims are being tried again
         let skippedGroup = [];              // the pilgrims that were skipped, when this second phase started
-        const editedRows = new Set();       // pilgrims whose Photo ID was already changed (done at most once)
+        // How many times each pilgrim's Photo ID was changed. Every time the blocked message comes back
+        // the Photo ID is changed again (new random Voter ID), up to MAX_EDITS_PER_PILGRIM times.
+        const MAX_EDITS_PER_PILGRIM = 3;
+        const editCounts = new Map();
         let forceCooldown = false; // true when only skipped pilgrims are left (wait before trying them again)
         const syncSkipped = () => {
             for (const it of progress.items) it.skipped = skipped.includes(it.row);
@@ -508,13 +511,13 @@ function createBot(botId) {
                         // The skipped pilgrims are blocked AGAIN: change their pilgrim details (Photo ID),
                         // then restart from login and book them.
                         if (err && err.skipUser && retryingSkipped) {
-                            const toEdit = skippedGroup.filter((r) => remaining.includes(r) && !editedRows.has(r));
+                            const toEdit = skippedGroup.filter((r) => remaining.includes(r) && (editCounts.get(r) || 0) < MAX_EDITS_PER_PILGRIM);
                             if (toEdit.length > 0) {
-                                console.log(`\n🛠 The skipped pilgrim(s) are still blocked. Changing the pilgrim details (Photo ID -> Voter ID) of rows: ${toEdit.join(', ')}`);
+                                console.log(`\n🛠 The skipped pilgrim(s) are still blocked. Changing the pilgrim details (Photo ID -> new Voter ID) of rows: ${toEdit.map((r) => `${r} (edit ${(editCounts.get(r) || 0) + 1}/${MAX_EDITS_PER_PILGRIM})`).join(', ')}`);
                                 setStep(`Changing pilgrim details (Photo ID) of row(s) ${toEdit.join(', ')}`);
                                 try {
                                     const res = await changePilgrimDetails(page, toEdit);
-                                    res.edited.forEach((r) => editedRows.add(r));
+                                    res.edited.forEach((r) => editCounts.set(r, (editCounts.get(r) || 0) + 1));
                                     if (res.removed.length) {
                                         remaining = remaining.filter((r) => !res.removed.includes(r));
                                         setStatus(res.removed, 'removed', { note: 'No Edit button on the Pilgrim List (already booked). Removed from this booking.', slot: '', date: '' });
@@ -535,7 +538,9 @@ function createBot(botId) {
                                 console.log('🔁 Closing the browser and restarting from LOGIN to book these pilgrim(s)...');
                                 break;
                             }
-                            // all of them were edited before: fall through to the normal skip handling below
+                            // every one of them already had its details changed the maximum number of times:
+                            console.log(`ℹ️ These pilgrims already had their details changed ${MAX_EDITS_PER_PILGRIM} times and are still blocked. Not editing again; they stay skipped and are retried later.`);
+                            // fall through to the normal skip handling below
                         }
 
                         if (err && err.skipUser) {
