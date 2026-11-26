@@ -4,20 +4,131 @@
 
 const { chromium } = require('playwright');
 
+const os = require('os');
+const fs = require('fs');
+
+const MB = 1024 * 1024;
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // ---------------------------------------------------------------------------------------------
-// ONE shared Chromium for ALL bots.
-// Starting a separate Chrome per bot (and per retry) quickly runs a small server out of processes
-// or memory ("spawn ... EAGAIN"), so the 2nd/3rd/4th bot could not start. Now every bot session
-// gets its own isolated browser CONTEXT inside the one shared Chromium: its own cookies, storage and
-// login, exactly like a brand-new browser, but without starting new Chrome processes.
+// Built for a SMALL server (e.g. 1 GB RAM) running many bots at once.
+//
+//  1. ONE shared Chromium for ALL bots. Every bot session is an isolated browser CONTEXT inside it
+//     (own cookies / storage / login = exactly like a brand-new browser), so extra bots do not start
+//     extra Chrome processes ("spawn ... EAGAIN") and cost far less memory.
+//  2. LITE mode (default): images and analytics trackers are not downloaded. The booking flow does not
+//     need them, and they are a large part of a page's memory. Set LITE_MODE=0 to turn this off.
+//  3. MEMORY GUARD: a new browser session only starts while there is free memory and a free slot.
+//     Extra bots wait in line (and say so in their console) instead of getting the whole server
+//     killed by the operating system for running out of memory. A session holds its slot only
+//     while it is open, so bots that are waiting out a cool-down use no memory.
+//  4. STAGGERED starts: sessions open ~1 s apart, so 10 bots starting together do not spike memory/CPU.
+//
+// Tune with environment variables:  MAX_BROWSER_SESSIONS, MIN_FREE_MB, OPEN_GAP_MS, LITE_MODE
 // ---------------------------------------------------------------------------------------------
+const LITE_MODE = process.env.LITE_MODE !== '0';
 const LEAN_BROWSER_ARGS = [
     '--disable-dev-shm-usage',   // Docker/Railway have a tiny /dev/shm; use normal temp files instead
     '--disable-gpu',
+    '--disable-software-rasterizer',
     '--disable-extensions',
     '--disable-background-networking',
+    '--disable-component-update',
+    '--disable-sync',
+    '--disable-translate',
+    '--disable-default-apps',
+    '--disable-breakpad',
+    '--no-first-run',
+    '--mute-audio',
+    '--metrics-recording-only',
+    '--js-flags=--max-old-space-size=256', // a runaway page cannot eat the whole server
     '--disable-features=IsolateOrigins,site-per-process', // fewer renderer processes
+    ...(LITE_MODE ? ['--blink-settings=imagesEnabled=false'] : []),
 ];
+const ANALYTICS_RE = /(google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|clarity\.ms)/i;
+
+// ---- memory reading (works inside Docker/Railway: reads the container limit, not the host's RAM) ----
+function readNumber(file) {
+    try {
+        const text = fs.readFileSync(file, 'utf8').trim();
+        if (text === 'max') return Infinity;
+        const n = Number(text);
+        return Number.isFinite(n) ? n : null;
+    } catch (e) { return null; }
+}
+function readStat(file, key) {
+    try {
+        const m = new RegExp(`^${key}\\s+(\\d+)`, 'm').exec(fs.readFileSync(file, 'utf8'));
+        return m ? Number(m[1]) : 0;
+    } catch (e) { return 0; }
+}
+function memoryInfo() {
+    let limit = os.totalmem();
+    let used = os.totalmem() - os.freemem();
+
+    const v2Limit = readNumber('/sys/fs/cgroup/memory.max');
+    const v1Limit = readNumber('/sys/fs/cgroup/memory/memory.limit_in_bytes');
+    const cgLimit = v2Limit != null ? v2Limit : v1Limit;
+    if (cgLimit && Number.isFinite(cgLimit) && cgLimit < limit) {
+        limit = cgLimit;
+        if (v2Limit != null) {
+            const current = readNumber('/sys/fs/cgroup/memory.current');
+            if (current != null) used = Math.max(0, current - readStat('/sys/fs/cgroup/memory.stat', 'inactive_file'));
+        } else {
+            const usage = readNumber('/sys/fs/cgroup/memory/memory.usage_in_bytes');
+            if (usage != null) used = Math.max(0, usage - readStat('/sys/fs/cgroup/memory/memory.stat', 'total_inactive_file'));
+        }
+    }
+    return { limitMB: Math.round(limit / MB), usedMB: Math.round(used / MB), freeMB: Math.max(0, Math.round((limit - used) / MB)) };
+}
+
+// ---- how many browser sessions may be open at once ----
+const MIN_FREE_MB = Number(process.env.MIN_FREE_MB) || 110;
+const MAX_SESSIONS = Number(process.env.MAX_BROWSER_SESSIONS)
+    || Math.max(1, Math.min(30, Math.floor((memoryInfo().limitMB - 250) / 80))); // ~250 MB for Node + Chromium itself, ~80 MB per session
+let sessionsActive = 0;
+let sessionsWaiting = 0;
+
+/** Waits (politely) until a session slot AND enough free memory exist. Returns a function that gives the slot back. */
+async function acquireSessionSlot(isStopped, onFirstWait) {
+    let counted = false;
+    try {
+        for (;;) {
+            if (isStopped()) throw new Error('Stopped');
+            const mem = memoryInfo();
+            if (sessionsActive < MAX_SESSIONS && mem.freeMB >= MIN_FREE_MB) {
+                sessionsActive++;
+                let released = false;
+                return () => { if (!released) { released = true; sessionsActive--; } };
+            }
+            if (!counted) {
+                counted = true;
+                sessionsWaiting++;
+                if (onFirstWait) onFirstWait({ active: sessionsActive, max: MAX_SESSIONS, freeMB: mem.freeMB });
+            }
+            await wait(2000);
+        }
+    } finally {
+        if (counted) sessionsWaiting--;
+    }
+}
+
+/** Live numbers for the page header. */
+function getSystemStats() {
+    return { ...memoryInfo(), sessions: sessionsActive, maxSessions: MAX_SESSIONS, waiting: sessionsWaiting };
+}
+
+// ---- open sessions ~1 s apart ----
+const OPEN_GAP_MS = Number(process.env.OPEN_GAP_MS) || 1200;
+let nextOpenAt = 0;
+async function staggerOpen() {
+    const now = Date.now();
+    const at = Math.max(now, nextOpenAt);
+    nextOpenAt = at + OPEN_GAP_MS;
+    if (at > now) await wait(at - now);
+}
+
+// ---- the one shared Chromium ----
 const sharedBrowsers = new Map(); // "headless|chrome" -> { browser } or { launching }
 
 async function getSharedBrowser(headless, useInstalledChrome) {
@@ -241,6 +352,7 @@ function createBot(botId) {
         // Browser choice:
         //  * "Use my installed Google Chrome" ticked -> your real Chrome (same as the original test.js).
         //  * otherwise Playwright's own Chromium.
+        await staggerOpen();
         const browser = await getSharedBrowser(HEADLESS, USE_INSTALLED_CHROME);
         if (STOPPED) throw new Error('Stopped');
 
@@ -252,7 +364,11 @@ function createBot(botId) {
             context = await browser.newContext({
                 viewport: { width: 1366, height: 850 },
                 userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                serviceWorkers: 'block',   // no background service worker (saves memory)
+                reducedMotion: 'reduce',   // fewer animation frames to render
+                acceptDownloads: false,
             });
+            if (LITE_MODE) await context.route(ANALYTICS_RE, (route) => route.abort()); // trackers are not needed
             activeContext = context;
             page = await context.newPage();
         } catch (e) {
@@ -315,8 +431,15 @@ function createBot(botId) {
             progress.session = session;
             setStep(`Session ${session}: opening a fresh browser and logging in`);
             let context = null;
+            let releaseSlot = null;
             try {
+                // Memory guard: wait here if the server is full (other bots are using the memory).
+                releaseSlot = await acquireSessionSlot(() => STOPPED, ({ active, max, freeMB }) => {
+                    console.log(`⏳ Waiting for a free browser slot (${active}/${max} in use, ${freeMB} MB free). This bot starts as soon as another bot closes its browser.`);
+                    setStep(`Session ${session}: waiting for a free browser slot (${active}/${max} in use)`);
+                });
                 console.log(`\n######## SESSION ${session}: opening a fresh browser, login starts from scratch ########`);
+                setStep(`Session ${session}: opening a fresh browser and logging in`);
                 const opened = await openSession();
                 context = opened.context;
                 const page = opened.page;
@@ -466,6 +589,7 @@ function createBot(botId) {
             } finally {
                 activeContext = null;
                 if (context) await context.close().catch(() => {}); // closes this session only (cookies/login gone)
+                if (releaseSlot) releaseSlot();                      // give the slot (and its memory) to a waiting bot
             }
 
             if (STOPPED || remaining.length === 0) break;
@@ -975,17 +1099,20 @@ function createBot(botId) {
                     const dayNum = String(parseInt(targetDate.day, 10));
                     const labelRegex = buildLabelRegex(targetDate);
                     const cells = page.locator('td.mat-calendar-body-cell');
-                    const count = await cells.count();
+                    // Read ALL calendar cells with ONE browser call (the old way made ~4 calls per cell,
+                    // ~170 calls per pass, which is a lot of CPU when many bots run together).
+                    const cellData = await page.$$eval('td.mat-calendar-body-cell', (els) => els.map((el) => ({
+                        text: (el.innerText || '').trim(),
+                        label: (el.getAttribute('aria-label') || '').trim(),
+                        cls: el.getAttribute('class') || '',
+                        ariaDisabled: el.getAttribute('aria-disabled'),
+                    })));
                     let dateCell = null;
                     let dayExistsButUnavailable = false;
                     const debugRows = [];
 
-                    for (let i = 0; i < count; i++) {
-                        const cell = cells.nth(i);
-                        const text = ((await cell.innerText()) || '').trim();
-                        const label = ((await cell.getAttribute('aria-label')) || '').trim();
-                        const cls = (await cell.getAttribute('class')) || '';
-                        const ariaDisabled = await cell.getAttribute('aria-disabled');
+                    for (let i = 0; i < cellData.length; i++) {
+                        const { text, label, cls, ariaDisabled } = cellData[i];
 
                         debugRows.push(`text="${text}" | label="${label}" | disabled=${ariaDisabled} | class="${cls}"`);
 
@@ -996,7 +1123,7 @@ function createBot(botId) {
                         const isAvailable = cls.includes('example-custom-date-class');
 
                         if (isAvailable && !isDisabled) {
-                            dateCell = cell;
+                            dateCell = cells.nth(i);
                             break;
                         } else {
                             dayExistsButUnavailable = true;
@@ -1813,7 +1940,7 @@ function createBot(botId) {
     async function run(cfg, logFn, progFn) {
         LOG = logFn;
         progressFn = progFn || (() => {});
-        console.log('Build: status-panel v2 (bot.js)');
+        console.log(`Build: low-memory v4 (bot.js). Up to ${MAX_SESSIONS} browser sessions at once, lite mode ${LITE_MODE ? 'on' : 'off'}.`);
         STOPPED = false;
         USERNAME = cfg.username; PASSWORD = cfg.password;
         TARGET_DATES = cfg.dates;
@@ -1839,4 +1966,4 @@ function createBot(botId) {
     return { run, stop };
 }
 
-module.exports = { createBot };
+module.exports = { createBot, getSystemStats };
