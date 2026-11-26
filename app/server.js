@@ -3,7 +3,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { createBot } = require('./e2e/bot');
+const { createBot, getSystemStats } = require('./e2e/bot');
 
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '127.0.0.1';
@@ -73,11 +73,18 @@ function emit(botId, type, data) {
         data = stamp(data);
         const b = bots[botId];
         b.logs.push(data);
-        if (b.logs.length > 2000) b.logs.shift();
+        if (b.logs.length > 800) b.logs.shift(); // small buffer: many bots on a small server
     }
     const line = JSON.stringify({ bot: botId, type, data });
     for (const c of clients) c.write(`data: ${line}\n\n`);
 }
+
+// Live memory / browser-session numbers for the page header (every 5 s, only while a page is open).
+setInterval(() => {
+    if (!clients.size) return;
+    const line = JSON.stringify({ type: 'system', data: getSystemStats() });
+    for (const c of clients) c.write(`data: ${line}\n\n`);
+}, 5000).unref();
 
 function startBot(botId, cfg) {
     const b = bots[botId];
@@ -159,7 +166,7 @@ http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
         const init = {};
         for (const b of Object.values(bots)) init[b.id] = { name: b.name, running: b.running, logs: b.logs, progress: b.progress };
-        res.write(`data: ${JSON.stringify({ type: 'init', data: { bots: init } })}\n\n`);
+        res.write(`data: ${JSON.stringify({ type: 'init', data: { bots: init, system: getSystemStats() } })}\n\n`);
         clients.add(res);
         return req.on('close', () => clients.delete(res));
     }
