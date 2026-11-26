@@ -66,6 +66,7 @@ details{margin-top:14px}summary{cursor:pointer;color:var(--mute);font-size:13px}
 .pane .head b{font-size:15px}
 .pane .head .state{margin-left:auto}
 .pane .head button{padding:4px 10px;font-size:13px}
+.sys{margin-top:10px;font-size:13px;color:var(--mute)}.sys b{color:var(--ink)}.sys .warn{color:#b45309;font-weight:600}
 .addbot{display:flex;gap:6px;align-items:center}
 .addbot input{width:170px;padding:6px 10px}
 .addbot button{font-weight:600;border-color:var(--go);color:var(--go);white-space:nowrap}
@@ -74,7 +75,8 @@ button.rm:disabled{opacity:.4;cursor:default}
 .note{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--go);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:13.5px;color:var(--mute)}
 </style></head><body>
 <header>
-<h1>Sabarimala booking console<small>Add as many bots as you need (type a name, press "+ Add bot"). Each bot has its own settings, console and isolated login, runs in the background and never stops until every pilgrim is booked (or you press Stop). <b>UI build: dynamic-bots v3</b></small></h1>
+<h1>Sabarimala booking console<small>Add as many bots as you need (type a name, press "+ Add bot"). Each bot has its own settings, console and isolated login, runs in the background and never stops until every pilgrim is booked (or you press Stop). <b>UI build: dynamic-bots v4 (low-memory)</b></small></h1>
+<div id="sys" class="sys" title="Live server numbers"></div>
 <nav id="tabs" aria-label="Bots"></nav>
 </header>
 <main id="views"></main>
@@ -84,7 +86,7 @@ const $=id=>document.getElementById(id);
 const REL=['Father','Mother','Son','Daughter','Brother','Sister','Spouse'];
 const relOpts=REL.map(r=>`<option>${r}</option>`).join('');
 const state={}; // id -> {running, logEls:[...]}
-const MAXLINES=2000;
+const MAXLINES=800,PANE_LINES=300; // small buffers: many bots at once
 
 /* ---------- the list of bots (kept in this browser) ---------- */
 let botList=[]; // [{id,name}]
@@ -251,7 +253,8 @@ function setRunning(n,r){state[n].running=r;const p=`b${n}-`;
 function addLog(n,t){for(const l of state[n].logEls){
   const end=l.scrollTop+l.clientHeight>=l.scrollHeight-30;
   l.append(t+'\n');
-  while(l.childNodes.length>MAXLINES)l.removeChild(l.firstChild);
+  const cap=l.id.startsWith('glog')?PANE_LINES:MAXLINES;
+  while(l.childNodes.length>cap)l.removeChild(l.firstChild);
   if(end)l.scrollTop=l.scrollHeight}}
 function clearLog(n){state[n].logEls.forEach(l=>l.textContent='')}
 
@@ -272,16 +275,20 @@ function renderProgress(n,pr){
  for(const id of [`b${n}-prog`,`gprog${n}`])$(id).innerHTML=html;
 }
 
+function showSys(s){if(!s)return;const low=s.freeMB<110;
+ $('sys').innerHTML=`Memory <b>${s.usedMB} / ${s.limitMB} MB</b> used &middot; Browser sessions <b>${s.sessions} / ${s.maxSessions}</b>`+(s.waiting?` &middot; <span class="warn">${s.waiting} bot(s) waiting for a free slot</span>`:'')+(low?` &middot; <span class="warn">low memory</span>`:'')}
 botList=loadList();
 botList.forEach(b=>addBotUI(b.id,b.name,false));
 const es=new EventSource('/api/events');
 es.onmessage=e=>{const m=JSON.parse(e.data);
  if(m.type==='init'){
+  showSys(m.data.system);
   const sb=m.data.bots||{};
   Object.keys(sb).forEach(k=>{const id=+k;if(!state[id])addBotUI(id,sb[k].name,false)});
   botList.forEach(({id})=>{const b=sb[id]||{running:false,logs:[]};clearLog(id);b.logs.forEach(t=>addLog(id,t));setRunning(id,b.running);renderProgress(id,b.progress)});
   show();
  }
+ else if(m.type==='system')showSys(m.data);
  else if(m.type==='bot-added'){if(!state[m.bot])addBotUI(m.bot,m.data.name,false)}
  else if(m.type==='bot-removed'){if(state[m.bot]&&!state[m.bot].running)removeBotUI(m.bot)}
  else if(m.type==='bot-name'){const b=botList.find(x=>x.id===m.bot);if(b&&b.name!==m.data.name&&document.activeElement!==$(`b${m.bot}-name`)){b.name=m.data.name;saveList();$(`b${m.bot}-name`).value=b.name;applyName(m.bot)}}
