@@ -5,4 +5,5 @@ RUN npm install
 COPY . .
 ENV PORT=3000 HOST=0.0.0.0
 EXPOSE 3000
-CMD ["node", "server.js"]
+# Node itself is capped at 192 MB so the memory stays for the browser sessions.
+CMD ["node", "--max-old-space-size=192", "server.js"]
