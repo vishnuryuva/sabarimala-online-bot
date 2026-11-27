@@ -466,7 +466,9 @@ function createBot(botId) {
         // the Photo ID is changed again (new random Voter ID), up to MAX_EDITS_PER_PILGRIM times.
         const MAX_EDITS_PER_PILGRIM = 3;
         const editCounts = new Map();
-        let forceCooldown = false; // true when only skipped pilgrims are left (wait before trying them again)
+        let forceCooldown = false;
+        let pendingStreak = 0;              // the "pending booking / quota" message in a row
+        const PENDING_STREAK_MAX = 3;       // after this many in a row: restart from login instead of retrying here // true when only skipped pilgrims are left (wait before trying them again)
         const syncSkipped = () => {
             for (const it of progress.items) it.skipped = skipped.includes(it.row);
             emitProgress();
@@ -531,6 +533,7 @@ function createBot(botId) {
                         remaining = remaining.filter((r) => !bookedRows.includes(r));
                         skipped = skipped.filter((r) => remaining.includes(r));
                         failures = 0;
+                        pendingStreak = 0;
                         forceCooldown = false;
                         setStatus(bookedRows, 'booked', { bookedAt: new Date().toISOString(), date: lastDate, slot: lastSlot, txnId: lastTransactionId });
                         setStep(remaining.length ? `Booked ${bookedRows.length}. Waiting to book the remaining ${remaining.length}` : 'All pilgrims booked');
@@ -552,6 +555,12 @@ function createBot(botId) {
 
                         // Site said "pending booking for the same slot / quota not available":
                         // stay in this browser and retry from date selection (no new login).
+                        if (err && err.restartFromDate) pendingStreak++; else pendingStreak = 0;
+                        if (err && err.restartFromDate && pendingStreak >= PENDING_STREAK_MAX) {
+                            console.log(`🔄 The same site message came ${pendingStreak} times in a row. Restarting from LOGIN with a fresh session instead of retrying the same page.`);
+                            pendingStreak = 0; // continue below as a normal failure (fresh browser + login)
+                            err.restartFromDate = false;
+                        }
                         if (err && err.restartFromDate) {
                             setStatus(remaining, 'pending', { slot: '', date: '' });
                             noteSiteMessage('pending-slot', err.siteMessage || '', (err.rows && err.rows.length) ? err.rows : pending, 'Retry from date selection');
@@ -688,11 +697,27 @@ function createBot(botId) {
             // Same browser and same login: just reload the booking page and start at the date.
             console.log('--- RETRY FROM DATE SELECTION (same browser, no new login) ---');
             setStep(`Round ${progress.round}: reloading the page and selecting the date again`);
+
+            // "Pending booking" usually means an item is sitting in the wishlist. The page is already showing
+            // it, so look at it RIGHT NOW (before the reload) and continue or clear it.
+            let wl = await quickWishlistCheck(page, remaining, 0);
+            if (wl && wl.resumed) return wl.resumed;
+
+            // Reload, and watch whether the site actually answers its wishlist request. If the site REFUSES
+            // that request (HTTP 403 ...), this session can never see or clear the wishlist, and retrying here
+            // would repeat the same message forever: restart from a fresh login instead.
+            const cartAnswer = page.waitForResponse((r) => /getCartDetails/i.test(r.url()), { timeout: 12000 }).catch(() => null);
             await page.reload();
             await page.waitForSelector(ROUTE_SELECTOR, { state: 'visible', timeout: ACTION_TIMEOUT_MS });
-            // "Pending booking" usually means an item is sitting in the wishlist: continue or clear it.
-            const wl = await quickWishlistCheck(page, remaining, WISHLIST_WAIT_MS);
+            const cart = await cartAnswer;
+            if (cart && cart.status() >= 400) {
+                throw new Error(`The site refused to show the wishlist (HTTP ${cart.status()}), so it cannot be checked or cleared from this session. Restarting from login.`);
+            }
+            wl = await quickWishlistCheck(page, remaining, cart ? 4000 : WISHLIST_WAIT_MS);
             if (wl && wl.resumed) return wl.resumed;
+            if (!wl) {
+                console.log('ℹ️ The site says a booking is already pending / quota is not available, but the wishlist is empty. That slot probably has no free quota for this many pilgrims right now, or an unpaid booking exists in Transaction History.');
+            }
         } else {
             console.log('--- STARTING LOGIN & NAVIGATION ---');
             setStep(`Round ${progress.round}: logging in and checking the wishlist`);
@@ -1957,7 +1982,99 @@ function createBot(botId) {
             throw new Error('Could not click Add to Wishlist. Restarting from the login page.');
         }
 
-        await checkoutFromProceed(page, firstProceedButton);
+        await checkoutFromProceed(page, null);
+    }
+
+    /** A known site message (see MSG_PENDING_SLOT / MSG_BLOCKED) turned into the error the retry loop understands. */
+    function siteMessageError(text) {
+        if (MSG_PENDING_SLOT.test(text)) {
+            const e = new Error('Pending booking for the same slot / quota not available. Retrying from date selection.');
+            e.restartFromDate = true; e.siteMessage = text;
+            return e;
+        }
+        if (MSG_BLOCKED.test(text)) {
+            const e = new Error('Previous booking not availed, so these pilgrim(s) cannot be booked now. Skipping them for now.');
+            e.skipUser = true; e.siteMessage = text;
+            return e;
+        }
+        return null;
+    }
+    async function visibleSiteMessage(page) {
+        const texts = await page.locator('.error-msg:visible').allInnerTexts().catch(() => []);
+        return texts.join(' ').replace(/\s+/g, ' ').trim();
+    }
+
+    /**
+     * Clicks the FIRST "Proceed" and makes sure the page really moved on.
+     * There can be several "Proceed" buttons at once (the wishlist box on the page AND the popup that sits
+     * on top of it behind a dark backdrop). A click on a covered button never reaches it, so the buttons are
+     * tried in a sensible order (popup first), a covered one is clicked directly in the page, and every try is
+     * checked: did the page move on, did the site show a message, or is it stuck?
+     */
+    async function clickFirstProceed(page, preferredButton) {
+        const startUrl = page.url();
+        const all = page.locator('button:visible:has-text("Proceed")');
+
+        // Describe every visible Proceed button (this is what the log shows if something goes wrong).
+        const infos = await all.evaluateAll((els) => els.map((el, index) => ({
+            index,
+            id: el.id || '',
+            cls: (el.className || '').toString().trim().slice(0, 40),
+            inPopup: !!el.closest('.cdk-overlay-container, mat-dialog-container, .modal, [role="dialog"], .feedback_form, .pop-up'),
+            inWishlist: !!el.closest('#wishlist-box'),
+        })));
+        console.log(`Visible "Proceed" button(s): ${infos.length ? infos.map((i) => `#${i.index}${i.inPopup ? ' popup' : ''}${i.inWishlist ? ' wishlist-box' : ''}${i.id ? ' id=' + i.id : ''}`).join(' | ') : 'none'}`);
+
+        // Order: popup buttons first, then other buttons, the wishlist box last; later in the page first.
+        const rank = (i) => (i.inPopup ? 0 : (i.inWishlist ? 2 : 1));
+        const order = infos.slice().sort((x, y) => rank(x) - rank(y) || y.index - x.index).map((i) => all.nth(i.index));
+        if (preferredButton) order.unshift(preferredButton); // e.g. the wishlist's own Proceed when continuing a wishlist item
+        if (order.length === 0) throw new Error('No "Proceed" button is visible.');
+
+        const attempts = Math.min(order.length, 3);
+        for (let n = 0; n < attempts; n++) {
+            const button = order[n];
+            let how = 'clicked';
+            try {
+                await button.click({ timeout: 3500 });
+            } catch (e) {
+                // Covered by another element: click it directly inside the page.
+                how = 'clicked directly in the page (it was covered)';
+                await button.evaluate((el) => el.click()).catch(() => {});
+            }
+            console.log(`Proceed button ${n + 1}/${attempts} ${how}. Checking that the page moves on...`);
+
+            const deadline = Date.now() + 12000;
+            while (Date.now() < deadline) {
+                if (STOPPED) throw new Error('Stopped');
+                const msg = await visibleSiteMessage(page);
+                const known = msg && siteMessageError(msg);
+                if (known) { console.log(`⚠️ Site message after Proceed: ${msg}`); throw known; }
+
+                const moved = page.url() !== startUrl
+                    || (await page.locator(ROUTE_SELECTOR).count()) === 0
+                    || !(await button.isVisible().catch(() => false));
+                if (moved) { console.log('Clicked first "Proceed". The page moved on.'); return; }
+                await page.waitForTimeout(300);
+            }
+            console.log(`⚠️ The page did not react to Proceed button ${n + 1}.${n + 1 < attempts ? ' Trying the next one...' : ''}`);
+        }
+        throw new Error('Proceed was clicked but the page did not move on.');
+    }
+
+    /** After the first Proceed: waits for the payment page's Proceed button, watching for the site's messages. */
+    async function waitForPaymentProceed(page) {
+        const deadline = Date.now() + SLOW_WAIT_MS;
+        const target = page.locator('button#regi_continue:has-text("Proceed")').first();
+        while (Date.now() < deadline) {
+            if (STOPPED) throw new Error('Stopped');
+            const msg = await visibleSiteMessage(page);
+            const known = msg && siteMessageError(msg);
+            if (known) { console.log(`⚠️ Site message while waiting for the payment page: ${msg}`); throw known; }
+            if (await target.isVisible().catch(() => false)) return;
+            await page.waitForTimeout(300);
+        }
+        throw new Error(`the payment page's Proceed button did not appear within ${SLOW_WAIT_MS / 1000}s`);
     }
 
     /**
@@ -1965,28 +2082,27 @@ function createBot(botId) {
      * -> its single "Proceed" button -> "Booking Confirmation" popup.
      * Throws unless the booking is confirmed by that popup.
      */
-    async function checkoutFromProceed(page, firstProceedButton) {
+    async function checkoutFromProceed(page, preferredButton) {
         // ---- Phase 2: first Proceed -> payment page -> final Proceed ----
         try {
-            await firstProceedButton.click();
-            console.log('Clicked first "Proceed". Waiting for the payment page...');
+            await clickFirstProceed(page, preferredButton);
 
-            await page.waitForSelector('button#regi_continue:has-text("Proceed")', {
-                state: 'visible',
-                timeout: SLOW_WAIT_MS,
-            });
+            await waitForPaymentProceed(page);
             console.log('Payment page Proceed button is visible.');
 
             // Click the final "Proceed" button on the payment gateway
             await page.click('button#regi_continue:has-text("Proceed")');
             console.log('Clicked final "Proceed" button on Payment Gateway.');
         } catch (error) {
+            if (error && (error.restartFromDate || error.skipUser)) throw error; // the site gave a known message
             const visibleButtons = (await page.locator('button:visible').allInnerTexts())
                 .map((text) => text.trim())
                 .filter(Boolean)
                 .slice(0, 10);
             console.log(`Payment page Proceed button did not appear. Current URL: ${page.url()}`);
             console.log(`Visible buttons: ${visibleButtons.join(' | ') || 'none'}`);
+            console.log(`Page says: ${await pageProblemText(page)}`);
+            await dumpWishlistDiagnostics(page, 'Proceed did not lead to the payment page');
             throw new Error(`Checkout did not reach the payment step: ${error.message.split('\n')[0]}`);
         }
 
