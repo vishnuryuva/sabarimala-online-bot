@@ -41,7 +41,6 @@ const LEAN_BROWSER_ARGS = [
     '--no-first-run',
     '--mute-audio',
     '--metrics-recording-only',
-    '--js-flags=--max-old-space-size=256', // a runaway page cannot eat the whole server
     '--disable-features=IsolateOrigins,site-per-process', // fewer renderer processes
     ...(LITE_MODE ? ['--blink-settings=imagesEnabled=false'] : []),
 ];
@@ -115,8 +114,21 @@ async function acquireSessionSlot(isStopped, onFirstWait) {
 
 /** Live numbers for the page header. */
 function getSystemStats() {
-    return { ...memoryInfo(), sessions: sessionsActive, maxSessions: MAX_SESSIONS, waiting: sessionsWaiting };
+    return { ...memoryInfo(), sessions: sessionsActive, maxSessions: MAX_SESSIONS, waiting: sessionsWaiting, nodeMB: Math.round(process.memoryUsage().rss / MB) };
 }
+
+// ---- safety valve: if memory is almost gone, close the OLDEST browser session instead of letting the
+// operating system kill the whole server. That bot reopens its session when memory is free again. ----
+const CRITICAL_FREE_MB = Number(process.env.CRITICAL_FREE_MB) || 60;
+const liveSessions = new Set();
+setInterval(() => {
+    if (!liveSessions.size) return;
+    const mem = memoryInfo();
+    if (mem.freeMB >= CRITICAL_FREE_MB) return;
+    let oldest = null;
+    for (const sess of liveSessions) if (!oldest || sess.startedAt < oldest.startedAt) oldest = sess;
+    if (oldest) oldest.kill(`only ${mem.freeMB} MB free`);
+}, 5000).unref();
 
 // ---- open sessions ~1 s apart ----
 const OPEN_GAP_MS = Number(process.env.OPEN_GAP_MS) || 1200;
@@ -164,6 +176,7 @@ function createBot(botId) {
         error: (...a) => LOG(a.map(x => (x && x.message) || x).join(' ')),
     };
     let STOPPED = false;
+    let killedForMemory = ''; // set when the memory safety valve closed this bot's session
     let activeContext = null; // this bot's current browser context (its own session inside the shared Chromium)
 
     // ---- Live booking progress (shown at the top of the console in the UI) ----
@@ -344,6 +357,46 @@ function createBot(botId) {
         }
     }
 
+    // ---- request diagnostics (the "Slot API activity" / "recent requests" lines in the log) ----
+    // IMPORTANT: Playwright keeps one object in Node's memory for EVERY request it reports to a
+    // listener, until the browser context is closed. The date-waiting loop reloads the page every
+    // ~7 s for hours, so permanent 'response'/'requestfailed' listeners made Node grow by ~100 MB per
+    // bot per 40 minutes and eventually crashed the whole server. So the listeners are ON only during the
+    // short phases that use them (login, route/slot, checkout) and OFF during the date loop.
+    let diagListeners = null;
+    const apiNote = (method, url, status) => {
+        let where = hostOf(url);
+        try {
+            const u = new URL(url);
+            // Keep the path for failures and for wishlist calls, so the log shows exactly what failed.
+            if (status === 'failed' || status >= 400 || /wish/i.test(u.pathname)) where = u.hostname + u.pathname;
+        } catch (e) { /* keep host only */ }
+        slotApiDiagnostics.push(`${method} ${where} ${status}`);
+        if (slotApiDiagnostics.length > 30) slotApiDiagnostics.shift();
+    };
+    function diagOn(page) {
+        if (diagListeners) return;
+        const onResponse = (response) => {
+            const request = response.request();
+            if (request.resourceType() !== 'xhr' && request.resourceType() !== 'fetch') return;
+            apiNote(request.method(), response.url(), response.status());
+        };
+        const onFailed = (request) => {
+            if (request.resourceType() !== 'xhr' && request.resourceType() !== 'fetch') return;
+            apiNote(request.method(), request.url(), 'failed');
+        };
+        page.on('response', onResponse);
+        page.on('requestfailed', onFailed);
+        diagListeners = { page, onResponse, onFailed };
+    }
+    function diagOff() {
+        if (!diagListeners) return;
+        const { page, onResponse, onFailed } = diagListeners;
+        page.off('response', onResponse);
+        page.off('requestfailed', onFailed);
+        diagListeners = null;
+    }
+
     /**
      * Opens a brand-new, fully isolated browser session (own cookies / storage, so the next step is a
      * fresh login) inside the shared Chromium.
@@ -358,6 +411,7 @@ function createBot(botId) {
 
         let context = null;
         let page;
+        let liveSession = null;
         try {
             // Same browser identity as the old, working bot: a fixed Windows Chrome user agent.
             // (This also avoids the "HeadlessChrome" name that makes the site load a blank page.)
@@ -371,7 +425,17 @@ function createBot(botId) {
             if (LITE_MODE) await context.route(ANALYTICS_RE, (route) => route.abort()); // trackers are not needed
             activeContext = context;
             page = await context.newPage();
+            liveSession = {
+                startedAt: Date.now(),
+                kill: (reason) => {
+                    killedForMemory = reason;
+                    console.log(`⚠️ Memory is almost full (${reason}). Closing this browser session so the server does not crash; it restarts when memory is free.`);
+                    context.close().catch(() => {});
+                },
+            };
+            liveSessions.add(liveSession);
         } catch (e) {
+            if (liveSession) liveSessions.delete(liveSession);
             if (context) await context.close().catch(() => {}); // never leave a session open if setup fails
             activeContext = null;
             throw e;
@@ -381,28 +445,10 @@ function createBot(botId) {
         page.setDefaultTimeout(ACTION_TIMEOUT_MS);
         page.setDefaultNavigationTimeout(ACTION_TIMEOUT_MS);
 
-        const apiNote = (method, url, status) => {
-            let where = hostOf(url);
-            try {
-                const u = new URL(url);
-                // Keep the path for failures and for wishlist calls, so the log shows exactly what failed.
-                if (status === 'failed' || status >= 400 || /wish/i.test(u.pathname)) where = u.hostname + u.pathname;
-            } catch (e) { /* keep host only */ }
-            slotApiDiagnostics.push(`${method} ${where} ${status}`);
-            if (slotApiDiagnostics.length > 30) slotApiDiagnostics.shift();
-        };
-        page.on('response', (response) => {
-            const request = response.request();
-            if (request.resourceType() !== 'xhr' && request.resourceType() !== 'fetch') return;
-            apiNote(request.method(), response.url(), response.status());
-        });
-        page.on('requestfailed', (request) => {
-            if (request.resourceType() !== 'xhr' && request.resourceType() !== 'fetch') return;
-            apiNote(request.method(), request.url(), 'failed');
-        });
+        diagOn(page); // request diagnostics (switched OFF during the long date-waiting loop, see selectDateOnly)
         page.on('pageerror', (error) => console.error(`Browser page error: ${error.message}`));
 
-        return { context, page };
+        return { context, page, liveSession };
     }
 
     async function runBookingBot() {
@@ -434,6 +480,7 @@ function createBot(botId) {
             progress.session = session;
             setStep(`Session ${session}: opening a fresh browser and logging in`);
             let context = null;
+            let liveSessionRef = null;
             let releaseSlot = null;
             try {
                 // Memory guard: wait here if the server is full (other bots are using the memory).
@@ -445,6 +492,7 @@ function createBot(botId) {
                 setStep(`Session ${session}: opening a fresh browser and logging in`);
                 const opened = await openSession();
                 context = opened.context;
+                liveSessionRef = opened.liveSession;
                 const page = opened.page;
                 let nextFromDate = false; // true -> next round skips login and starts at date selection
 
@@ -493,6 +541,14 @@ function createBot(botId) {
                         }
                     } catch (err) {
                         if (STOPPED) break;
+
+                        // The memory safety valve closed this browser to keep the server alive: not a booking
+                        // failure, just open a new session (it waits for free memory first).
+                        if (killedForMemory) {
+                            console.log(`♻️ Browser session closed to free memory (${killedForMemory}). Starting a new session when memory is free.`);
+                            killedForMemory = '';
+                            break;
+                        }
 
                         // Site said "pending booking for the same slot / quota not available":
                         // stay in this browser and retry from date selection (no new login).
@@ -593,6 +649,7 @@ function createBot(botId) {
                 }
             } finally {
                 activeContext = null;
+                if (liveSessionRef) liveSessions.delete(liveSessionRef);
                 if (context) await context.close().catch(() => {}); // closes this session only (cookies/login gone)
                 if (releaseSlot) releaseSlot();                      // give the slot (and its memory) to a waiting bot
             }
@@ -1008,6 +1065,15 @@ function createBot(botId) {
      * specified in TARGET_DATES and selects the exact target day (only if it is enabled).
      */
     async function selectDateOnly(page, remaining) {
+        diagOff(); // no request listeners while waiting for the date (see the note above diagOn)
+        try {
+            return await selectDateLoop(page, remaining);
+        } finally {
+            diagOn(page); // the next phases (route/slot, checkout) use the diagnostics again
+        }
+    }
+
+    async function selectDateLoop(page, remaining) {
         console.log('--- STARTING DATE CHECK LOOP (Dynamic Month/Year Navigation) ---');
 
         const nextMonthBtn = page.locator('button.mat-calendar-next-button[aria-label="Next month"]');
