@@ -583,12 +583,14 @@ function createBot(botId) {
                                 try {
                                     const res = await changePilgrimDetails(page, toEdit);
                                     res.edited.forEach((r) => editCounts.set(r, (editCounts.get(r) || 0) + 1));
+                                    res.failed.forEach((r) => editCounts.set(r, (editCounts.get(r) || 0) + 1)); // a failed edit also uses up one of the tries
                                     if (res.removed.length) {
                                         remaining = remaining.filter((r) => !res.removed.includes(r));
                                         setStatus(res.removed, 'removed', { note: 'No Edit button on the Pilgrim List (already booked). Removed from this booking.', slot: '', date: '' });
                                         console.log(`🗑 Removed from the booking list: rows ${res.removed.join(', ')}`);
                                     }
-                                    console.log(`🛠 Details changed for rows: ${res.edited.length ? res.edited.join(', ') : 'none'}${res.failed.length ? `   |   could not change rows: ${res.failed.join(', ')}` : ''}`);
+                                    console.log(`🛠 Details changed for rows: ${res.edited.length ? res.edited.join(', ') : 'none'}${res.failed.length ? `   |   could not change rows: ${res.failed.map((r) => `${r} [${(res.reasons && res.reasons[r]) || 'unknown'}]`).join('; ')}` : ''}`);
+                                    if (res.failed.length) noteSiteMessage('edit-failed', Object.values(res.reasons || {}).join(' ; ').slice(0, 300), res.failed, 'Edit failed');
                                 } catch (editErr) {
                                     if (STOPPED) break;
                                     console.log(`⚠️ Changing the pilgrim details stopped: ${editErr.message.split('\n')[0]}`);
@@ -899,6 +901,11 @@ function createBot(botId) {
         const wlTime = details['Time'] || '';
         const wlPilgrims = parseInt(details['No. of Pilgrims'], 10);
         console.log(`Wishlist has an item: date ${wlDate || '?'}, time ${wlTime || '?'}, pilgrims ${Number.isNaN(wlPilgrims) ? '?' : wlPilgrims}. Slot message: "${slotMsg || '(none)'}"`);
+        if (slotMsg) {
+            console.log(`❌ WISHLIST ERROR: "${slotMsg}"  (wishlist item: date ${wlDate || '?'}, time ${wlTime || '?'}, pilgrims ${Number.isNaN(wlPilgrims) ? '?' : wlPilgrims})`);
+            setStep(`Wishlist says: "${slotMsg}"`);
+            noteSiteMessage('wishlist', slotMsg, remaining, 'Wishlist item cannot be used');
+        }
 
         // 1) The wishlist date must be one of the dates set in the bot (the time slot is NOT compared).
         const matchedDate = matchWishlistDate(wlDate);
@@ -924,6 +931,16 @@ function createBot(botId) {
         try {
             const wishlistProceed = box.locator('button:has-text("Proceed")').first();
             await wishlistProceed.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+            // The slot message can arrive a moment late: look once more right before clicking.
+            const lateMsg = await box.locator('#slotMsg').first().innerText({ timeout: 1000 })
+                .then((t) => t.replace(/\s+/g, ' ').trim()).catch(() => '');
+            if (lateMsg) {
+                console.log(`❌ WISHLIST ERROR (appeared before Proceed): "${lateMsg}". Not clicking Proceed; clearing the wishlist.`);
+                setStep(`Wishlist says: "${lateMsg}"`);
+                noteSiteMessage('wishlist', lateMsg, rows, 'Wishlist item cannot be used');
+                setStatus(rows, 'pending', { slot: '', date: '' });
+                return null; // caller clears it
+            }
             await checkoutFromProceed(page, wishlistProceed);
         } catch (err) {
             resumeFailedBefore = true; // next round: clear the wishlist and book normally
@@ -1416,34 +1433,93 @@ function createBot(botId) {
         return id;
     }
 
+    /** Waits until the page address (hash route) matches, e.g. /editPilgrim. */
+    const waitForRoute = (page, re, ms) => page.waitForFunction(
+        (src) => new RegExp(src, 'i').test(location.href), re.source, { timeout: ms || ACTION_TIMEOUT_MS });
+
+    /** Clicks normally; if the element is covered / has no size, clicks it directly inside the page. */
+    async function clickOrForce(locator, ms) {
+        try {
+            await locator.click({ timeout: ms || 3500 });
+        } catch (e) {
+            await locator.evaluate((el) => el.click());
+        }
+    }
+
+    /** Collects what the page is showing when a step fails: address, visible messages, invalid fields. */
+    async function editFailureDiagnostics(page, row, step) {
+        try {
+            const info = await page.evaluate(() => {
+                const vis = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                const texts = [...document.querySelectorAll('.error-msg, .text-danger, .alert, .mat-error, .invalid-feedback, .feedback_form .content')]
+                    .filter(vis).map((e) => (e.innerText || '').replace(/\s+/g, ' ').trim()).filter((t) => t && t !== '*');
+                const invalid = [...document.querySelectorAll('input.ng-invalid, select.ng-invalid')]
+                    .map((e) => `${e.name || e.id || e.tagName}${e.value ? '' : ' (empty)'}`);
+                const upd = [...document.querySelectorAll('button')].find((b) => /^\s*update\s*$/i.test(b.innerText));
+                const idBox = document.querySelector('input[name="proofIdNum"]');
+                return {
+                    url: location.href,
+                    texts: [...new Set(texts)].slice(0, 6),
+                    invalid,
+                    update: upd ? `disabled=${upd.disabled}` : 'not on this page',
+                    idBox: idBox ? `value="${idBox.value}" pattern="${idBox.getAttribute('pattern') || ''}" maxlength="${idBox.getAttribute('maxlength') || ''}"` : 'not on this page',
+                };
+            });
+            console.log(`   [edit diagnostics row ${row}, step "${step}"] page: ${info.url}`);
+            console.log(`   [edit diagnostics row ${row}] messages on screen: ${info.texts.length ? info.texts.join(' || ') : 'none'}`);
+            console.log(`   [edit diagnostics row ${row}] invalid fields: ${info.invalid.length ? info.invalid.join(', ') : 'none'} | Update button: ${info.update} | Photo ID Number box: ${info.idBox}`);
+            fs.mkdirSync('debug', { recursive: true });
+            const file = `debug/bot${botId}-editfail-row${row}-${Date.now()}.png`;
+            await page.screenshot({ path: file, fullPage: true, timeout: 5000 });
+            console.log(`   [edit diagnostics row ${row}] screenshot saved: ${file}`);
+            return info.texts.join(' || ');
+        } catch (e) {
+            console.log(`   [edit diagnostics] could not collect: ${e.message.split('\n')[0]}`);
+            return '';
+        }
+    }
+
     /** Opens the account menu and clicks "Pilgrim List" (the page only opens this way, not by address). */
-    async function openPilgrimList(page) {
+    async function openPilgrimList(page, mark) {
         if (!/pilgrimList/i.test(page.url())) {
+            mark('opening the account menu');
             const menu = page.locator('span.nav-link.logout-name').first();
             await menu.waitFor({ state: 'attached', timeout: ACTION_TIMEOUT_MS });
-            try {
-                await menu.click({ timeout: 3000 });
-            } catch (e) {
-                await menu.evaluate((el) => el.click()); // the icon span can have no size; click it directly
-            }
             const item = page.locator('div[routerlink="/pilgrimList"]').first();
-            await item.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
-            await Promise.all([
-                page.waitForURL('**/pilgrimList', { timeout: ACTION_TIMEOUT_MS }),
-                item.click({ timeout: ACTION_TIMEOUT_MS }),
-            ]);
+
+            // The menu icon is an empty span, so a normal click can miss. Try three ways, checking each time
+            // that the "Pilgrim List" entry really appeared.
+            let opened = false;
+            for (let attempt = 1; attempt <= 3 && !opened; attempt++) {
+                try {
+                    if (attempt === 1) await clickOrForce(menu, 3000);
+                    else if (attempt === 2) await menu.evaluate((el) => el.click());
+                    else await menu.evaluate((el) => (el.parentElement || el).click());
+                } catch (e) { /* try the next way */ }
+                opened = await item.waitFor({ state: 'visible', timeout: 2500 }).then(() => true).catch(() => false);
+                if (!opened) console.log(`⚠️ "Pilgrim List" did not show after menu click ${attempt}/3.`);
+            }
+            if (!opened && (await item.count()) === 0) throw new Error('The "Pilgrim List" entry never appeared in the account menu.');
+
+            mark('clicking Pilgrim List');
+            await clickOrForce(item, 3500);
+            await waitForRoute(page, /pilgrimList/, ACTION_TIMEOUT_MS);
         }
-        await page.waitForSelector('tr.mat-row, mat-row', { timeout: ACTION_TIMEOUT_MS });
+        mark('reading the Pilgrim List');
+        await page.waitForSelector('tr.mat-row, mat-row, tr.mat-mdc-row', { timeout: ACTION_TIMEOUT_MS });
+        await page.waitForLoadState('networkidle', { timeout: 4000 }).catch(() => {});
         console.log('Opened the Pilgrim List page.');
     }
 
     /**
      * Finds the row of a pilgrim (original row number) on the Pilgrim List page.
-     * The pilgrim is recognised by the text remembered from the selection page (name, age ...);
-     * if nothing was remembered, the same row number is used. Returns a locator or null.
+     * The pilgrim is recognised by name / age / gender words remembered from the selection page.
+     * Photo ID words and numbers are IGNORED on purpose: the Pilgrim List shows the Photo ID type and a
+     * masked number, and after an edit the type is "Voter ID" instead of "Aadhaar", so they never match.
+     * Returns a locator or null.
      */
     async function findPilgrimListRow(page, originalRow) {
-        const rows = page.locator('tr.mat-row, mat-row');
+        const rows = page.locator('tr.mat-row, mat-row, tr.mat-mdc-row');
         const count = await rows.count();
         const texts = [];
         for (let i = 0; i < count; i++) texts.push(normalizeText(await rows.nth(i).innerText().catch(() => '')));
@@ -1457,28 +1533,44 @@ function createBot(botId) {
             return null;
         }
 
-        // Score each list row by how many of ITS words (name, age, gender ...) appear in the text saved
-        // for this pilgrim on the selection page. (The saved text can contain extra words, so the row's
-        // own words are the reliable side.)
-        const ignore = new Set(['edit', 'delete', 'view', 'action', 'actions']);
-        const wordsOf = (t) => [...new Set(String(t).split(/[^a-z0-9]+/).filter((w) => w.length >= 2 && !ignore.has(w)))];
+        const IGNORE = new Set(['edit', 'delete', 'view', 'action', 'actions', 'aadhaar', 'aadhar', 'adhar', 'voter', 'passport', 'id', 'photo', 'type', 'number', 'select']);
+        const wordsOf = (t) => [...new Set(String(t).split(/[^a-z0-9]+/).filter((w) =>
+            w.length >= 2 && !IGNORE.has(w) && !(/\d/.test(w) && w.length >= 6) && !/^x+\d*$/.test(w)))];
+        const identWords = wordsOf(identity);
+
         const scoreOf = (t) => {
-            const words = wordsOf(t);
-            return words.length ? words.filter((w) => identity.includes(w)).length / words.length : 0;
+            const rowWords = wordsOf(t);
+            const matched = rowWords.filter((w) => identWords.includes(w));
+            const denom = Math.min(rowWords.length, identWords.length);
+            const hasName = matched.some((w) => w.length >= 3 && /[a-z]/.test(w));
+            return denom && hasName ? matched.length / denom : 0;
         };
 
         const scores = texts.map(scoreOf);
         const bestScore = Math.max(0, ...scores);
-        if (bestScore < 0.6) return null;
+        if (bestScore < 0.5) {
+            console.log(`⚠️ No Pilgrim List row matches pilgrim row ${originalRow}. Saved text: "${identity.slice(0, 80)}"`);
+            texts.slice(0, 8).forEach((t, i) => console.log(`   list row ${i + 1}: "${t.slice(0, 80)}" (match ${Math.round(scores[i] * 100)}%)`));
+            return null;
+        }
         const winners = scores.map((sc, i) => (sc === bestScore ? i : -1)).filter((i) => i >= 0);
-        // several equally good rows: prefer the same row number, otherwise the first one
         const best = winners.includes(originalRow - 1) ? originalRow - 1 : winners[0];
         console.log(`Pilgrim row ${originalRow} is row ${best + 1} on the Pilgrim List (match ${Math.round(bestScore * 100)}%).`);
         return rows.nth(best);
     }
 
+    /** Text of the visible error messages on the edit page (empty string if none). */
+    async function visibleEditErrors(page) {
+        return page.evaluate(() => {
+            const vis = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+            return [...new Set([...document.querySelectorAll('.error-msg, .text-danger, .mat-error, .invalid-feedback')]
+                .filter(vis).map((e) => (e.innerText || '').replace(/\s+/g, ' ').trim()).filter((t) => t && t !== '*'))].join(' || ');
+        }).catch(() => '');
+    }
+
     /** On the edit page: Photo ID Type = Voter ID, a new random Voter ID number, Update, OK. */
-    async function changePhotoIdToVoterId(page) {
+    async function changePhotoIdToVoterId(page, mark) {
+        mark('selecting Voter ID');
         const typeSelect = page.locator('select[name="proofId"]').first();
         await typeSelect.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
 
@@ -1487,52 +1579,97 @@ function createBot(botId) {
         } catch (e) {
             await typeSelect.selectOption({ label: 'Voter ID' });
         }
-        const chosen = await typeSelect.evaluate((el) => el.options[el.selectedIndex] && el.options[el.selectedIndex].text.trim());
+        const chosen = await typeSelect.evaluate((el) => (el.options[el.selectedIndex] && el.options[el.selectedIndex].text.trim()) || '');
         console.log(`Photo ID Type selected: ${chosen}`);
+        if (!/voter/i.test(chosen)) throw new Error(`Photo ID Type is still "${chosen || 'empty'}" after selecting Voter ID.`);
+        await page.waitForTimeout(700); // the page re-draws the number box after the type changes
 
-        const voterId = randomVoterId();
-        const numberInput = page.locator('input[name="proofIdNum"]').first();
-        await numberInput.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
-        await numberInput.fill(voterId);
-        await numberInput.press('Tab'); // blur so the page validates the new number
-        console.log(`Photo ID Number entered: ${voterId}`);
+        // Up to 3 tries: the site may refuse a number (already used / not valid); each try uses a NEW random number.
+        let lastPopup = '';
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            mark('typing the Voter ID number');
+            const voterId = randomVoterId();
+            const numberInput = page.locator('input[name="proofIdNum"]').first();
+            await numberInput.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+            await numberInput.click({ timeout: 3000 }).catch(() => {});
+            await numberInput.fill('');
+            await numberInput.fill(voterId);
+            let typed = (await numberInput.inputValue()).toUpperCase();
+            if (typed !== voterId) {
+                await numberInput.fill('');
+                await numberInput.pressSequentially(voterId, { delay: 40 });
+                typed = (await numberInput.inputValue()).toUpperCase();
+            }
+            if (typed !== voterId) throw new Error(`The Photo ID Number box did not accept "${voterId}" (it shows "${typed}").`);
+            await numberInput.press('Tab'); // blur so the page validates the new number
+            console.log(`Photo ID Number entered: ${voterId} (try ${attempt}/3)`);
 
-        await page.locator('button#regi_continue:has-text("Update")').first().click({ timeout: ACTION_TIMEOUT_MS });
+            mark('clicking Update');
+            const updateBtn = page.locator('button#regi_continue:has-text("Update")').first();
+            await updateBtn.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
+            await updateBtn.scrollIntoViewIfNeeded().catch(() => {});
+            for (let w = 0; w < 10 && (await updateBtn.isDisabled().catch(() => false)); w++) await page.waitForTimeout(300);
+            if (await updateBtn.isDisabled().catch(() => false)) {
+                throw new Error(`The Update button stays disabled. Site says: ${(await visibleEditErrors(page)) || 'nothing visible'}`);
+            }
+            await clickOrForce(updateBtn, 3500);
 
-        // Popup: "Pilgrim Details has been updated successfully."  -> OK
-        const popup = page.locator('.feedback_form').first();
-        await popup.waitFor({ state: 'visible', timeout: SLOW_WAIT_MS });
-        const text = ((await popup.innerText()) || '').replace(/\s+/g, ' ').trim();
-        if (!/updated successfully/i.test(text)) {
-            throw new Error(`The site did not confirm the update. Popup says: ${text.slice(0, 200)}`);
+            // Popup: "Pilgrim Details has been updated successfully."  -> OK
+            mark('waiting for the Update result popup');
+            const popup = page.locator('.feedback_form').first();
+            const deadline = Date.now() + SLOW_WAIT_MS;
+            let shown = false;
+            while (Date.now() < deadline) {
+                if (STOPPED) throw new Error('Stopped');
+                if (await popup.isVisible().catch(() => false)) { shown = true; break; }
+                await page.waitForTimeout(300);
+            }
+            if (!shown) {
+                throw new Error(`No popup appeared ${SLOW_WAIT_MS / 1000}s after Update. Messages on screen: ${(await visibleEditErrors(page)) || 'none'}`);
+            }
+            const text = ((await popup.innerText()) || '').replace(/\s+/g, ' ').trim();
+            const okBtn = popup.locator('button:has-text("OK")').filter({ hasText: /^\s*ok\s*$/i }).first();
+
+            if (/updated successfully/i.test(text)) {
+                console.log(`✅ ${text.slice(0, 100)}`);
+                mark('clicking OK');
+                await clickOrForce(okBtn, ACTION_TIMEOUT_MS);
+                await popup.waitFor({ state: 'hidden', timeout: ACTION_TIMEOUT_MS }).catch(() => {});
+                return voterId;
+            }
+
+            lastPopup = text.slice(0, 200);
+            console.log(`⚠️ The site did not accept the update (try ${attempt}/3). Popup says: "${lastPopup}"`);
+            await clickOrForce(okBtn, ACTION_TIMEOUT_MS).catch(() => {});
+            await popup.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {});
         }
-        const shown = ((await popup.locator('.content').first().innerText().catch(() => '')) || text).replace(/\s+/g, ' ').trim();
-        console.log(`✅ ${shown.slice(0, 100)}`);
-        await popup.locator('button:has-text("OK")').filter({ hasText: /^\s*ok\s*$/i }).first().click({ timeout: ACTION_TIMEOUT_MS });
-        await popup.waitFor({ state: 'hidden', timeout: ACTION_TIMEOUT_MS }).catch(() => {});
-        return voterId;
+        throw new Error(`The site refused the Voter ID update 3 times. Last popup: "${lastPopup}"`);
     }
 
     /**
      * Changes the Photo ID of every given pilgrim (original row numbers).
-     * Returns { edited: [rows], removed: [rows], failed: [rows] }
+     * Returns { edited: [rows], removed: [rows], failed: [rows], reasons: { row: "step: message" } }
      *   edited  - Photo ID changed to a new Voter ID
      *   removed - NO Edit button on the Pilgrim List (that pilgrim is already booked / has a transaction):
      *             not edited, and to be dropped from this bot's booking list
-     *   failed  - something went wrong for this pilgrim (not found, update refused ...)
+     *   failed  - something went wrong for this pilgrim; reasons[row] says at WHICH STEP and why
      */
     async function changePilgrimDetails(page, rows) {
-        const result = { edited: [], removed: [], failed: [] };
+        const result = { edited: [], removed: [], failed: [], reasons: {} };
         for (const row of rows) {
             if (STOPPED) throw new Error('Stopped');
+            let step = 'starting';
+            const mark = (s) => { step = s; setStep(`Editing pilgrim row ${row}: ${s}`); };
             try {
                 console.log(`--- CHANGING DETAILS OF PILGRIM ROW ${row} ---`);
-                await openPilgrimList(page);
+                await openPilgrimList(page, mark);
 
+                mark('finding the pilgrim on the list');
                 const listRow = await findPilgrimListRow(page, row);
                 if (!listRow) {
                     console.log(`⚠️ Pilgrim row ${row} was not found on the Pilgrim List. Not edited.`);
                     result.failed.push(row);
+                    result.reasons[row] = 'finding the pilgrim on the list: no matching row';
                     continue;
                 }
 
@@ -1544,17 +1681,25 @@ function createBot(botId) {
                 }
 
                 // The edit page only opens by clicking Edit (it cannot be opened by address).
-                await Promise.all([
-                    page.waitForURL('**/editPilgrim', { timeout: ACTION_TIMEOUT_MS }),
-                    editButton.click({ timeout: ACTION_TIMEOUT_MS }),
-                ]);
+                mark('clicking Edit');
+                await editButton.scrollIntoViewIfNeeded().catch(() => {});
+                await clickOrForce(editButton, 4000);
+                let onEditPage = await waitForRoute(page, /editPilgrim/, 6000).then(() => true).catch(() => false);
+                if (!onEditPage) {
+                    console.log('⚠️ The Edit page did not open after the first click. Clicking Edit directly in the page...');
+                    await editButton.evaluate((el) => el.click());
+                    await waitForRoute(page, /editPilgrim/, ACTION_TIMEOUT_MS);
+                }
                 console.log('Opened the Edit Pilgrim page.');
 
-                await changePhotoIdToVoterId(page);
+                await changePhotoIdToVoterId(page, mark);
                 result.edited.push(row);
             } catch (e) {
-                console.log(`⚠️ Could not change the details of pilgrim row ${row}: ${e.message.split('\n')[0]}`);
+                const why = e.message.split('\n')[0];
+                console.log(`❌ EDIT FAILED for pilgrim row ${row} at step "${step}": ${why}`);
+                const onScreen = await editFailureDiagnostics(page, row, step);
                 result.failed.push(row);
+                result.reasons[row] = `${step}: ${why}${onScreen ? ` | page shows: ${onScreen}` : ''}`;
                 // go back to a known page so the next pilgrim starts clean
                 await page.goto('https://sabarimalaonline.org/#/darshan').catch(() => {});
             }
