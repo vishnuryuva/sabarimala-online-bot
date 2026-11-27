@@ -575,8 +575,11 @@ function createBot(botId) {
                         // skip THESE pilgrims for now, carry on with the others, retry the skipped ones last.
                         // The skipped pilgrims are blocked AGAIN: change their pilgrim details (Photo ID),
                         // then restart from login and book them.
-                        if (err && err.skipUser && retryingSkipped) {
-                            const toEdit = skippedGroup.filter((r) => remaining.includes(r) && (editCounts.get(r) || 0) < MAX_EDITS_PER_PILGRIM);
+                        if (err && err.skipUser) {
+                            // Edit RIGHT AWAY on the first "previous booking" message (no skipping first): only the pilgrims
+                            // the site blocked in this attempt are edited, then booking restarts for them + everyone left.
+                            const blockedNow = (err.rows && err.rows.length) ? err.rows : pending.slice(0, 1);
+                            const toEdit = blockedNow.filter((r) => remaining.includes(r) && (editCounts.get(r) || 0) < MAX_EDITS_PER_PILGRIM);
                             if (toEdit.length > 0) {
                                 console.log(`\n🛠 The skipped pilgrim(s) are still blocked. Changing the pilgrim details (Photo ID -> new Voter ID) of rows: ${toEdit.map((r) => `${r} (edit ${(editCounts.get(r) || 0) + 1}/${MAX_EDITS_PER_PILGRIM})`).join(', ')}`);
                                 setStep(`Changing pilgrim details (Photo ID) of row(s) ${toEdit.join(', ')}`);
@@ -601,6 +604,7 @@ function createBot(botId) {
                                 syncSkipped();
                                 setStatus(remaining, 'pending', { slot: '', date: '' });
                                 logSummary();
+                                forceCooldown = false; // no waiting: book straight away with the updated details
                                 setStep('Pilgrim details changed. Restarting from login to book them');
                                 console.log('🔁 Closing the browser and restarting from LOGIN to book these pilgrim(s)...');
                                 break;
