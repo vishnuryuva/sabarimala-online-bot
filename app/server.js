@@ -79,6 +79,10 @@ function emit(botId, type, data) {
     for (const c of clients) c.write(`data: ${line}\n\n`);
 }
 
+// Never let one unexpected error in one bot take the whole server (and every other bot) down.
+process.on('uncaughtException', (e) => console.error('Unexpected error (the server keeps running):', e));
+process.on('unhandledRejection', (e) => console.error('Unhandled promise rejection (the server keeps running):', e));
+
 // Live memory / browser-session numbers for the page header (every 5 s, only while a page is open).
 setInterval(() => {
     if (!clients.size) return;
