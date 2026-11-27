@@ -321,7 +321,7 @@ function createBot(botId) {
     // judged empty. If WISHLIST_DOUBLE_CHECK is true, the page is reloaded ONCE and checked again
     // before trusting "empty" (costs a few seconds per round; set to false to skip it).
     const WISHLIST_WAIT_MS = 3000;
-    const WISHLIST_DOUBLE_CHECK = false; // fresh browser every attempt, so no extra reload is needed
+    const WISHLIST_DOUBLE_CHECK = true; // verify the server-backed wishlist after every fresh login
 
     // How many times to click "Add to Wishlist" if the Proceed popup does not appear.
     const ADD_TO_WISHLIST_ATTEMPTS = 3;
@@ -1013,45 +1013,77 @@ function createBot(botId) {
     async function clearWishlistIfPresent(page, beforeClear) {
         console.log('--- CHECKING WISHLIST ---');
         try {
-            // The wishlist box is part of the booking page. If it never appears, the page itself did
-            // not load (blank page / blocked), which is NOT the same as an empty wishlist.
-            try {
-                await page.waitForSelector('#wishlist-box', { state: 'attached', timeout: 10000 });
-            } catch (e) {
-                const title = await page.title().catch(() => '');
-                const text = await page.locator('body').innerText({ timeout: 3000 })
-                    .then((t) => t.replace(/\s+/g, ' ').trim().slice(0, 200)).catch(() => '');
-                throw new Error(`The booking page did not load (no wishlist box). Page title: "${title}". Page text: "${text || 'blank'}". The site may be blocking this browser.`);
-            }
+            const box = page.locator('#wishlist-box').first();
+            await box.waitFor({ state: 'attached', timeout: ACTION_TIMEOUT_MS });
 
-            // Same selector as the original script (.first() only guards against duplicates).
+            // The Angular app can render the outer wishlist shell before its API-backed
+            // content arrives. Do not interpret that initial shell as an empty wishlist.
+            await page.locator('#wishlist-box app-wishlist').waitFor({
+                state: 'attached', timeout: ACTION_TIMEOUT_MS
+            });
+            await page.waitForLoadState('networkidle', { timeout: 7000 }).catch(() => {});
+            await page.waitForFunction(() => {
+                const loader = document.querySelector('#wishlist-box #loader');
+                if (!loader) return false;
+                const style = getComputedStyle(loader);
+                return style.display === 'none' || style.visibility === 'hidden' ||
+                    loader.getAttribute('aria-hidden') === 'true';
+            }, { timeout: ACTION_TIMEOUT_MS }).catch(() => {});
+            // Let Angular finish the final change-detection pass after the loader closes.
+            await page.waitForTimeout(1200);
+
             const clearBtn = page.locator('#wishlist-box button:has-text("Clear Wishlist")').first();
-            const appears = async (ms) => {
-                try { await clearBtn.waitFor({ state: 'visible', timeout: ms }); return true; } catch (e) { return false; }
-            };
+            const hasItem = await clearBtn.isVisible().catch(() => false);
 
-            let found = await appears(WISHLIST_WAIT_MS);
-
-            if (!found && WISHLIST_DOUBLE_CHECK) {
-                await describeWishlist(page, 'first look');
-                console.log('Wishlist looks empty. Reloading the page once to double-check...');
-                await page.reload();
-                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
-                found = await appears(WISHLIST_WAIT_MS);
+            if (!hasItem && WISHLIST_DOUBLE_CHECK) {
+                await describeWishlist(page, 'first look after component load');
+                console.log('No wishlist item button yet. Refreshing once to verify the server-backed state...');
+                await page.reload({ waitUntil: 'domcontentloaded' });
+                await page.waitForSelector('#wishlist-box app-wishlist', { state: 'attached', timeout: ACTION_TIMEOUT_MS });
+                await page.waitForLoadState('networkidle', { timeout: 7000 }).catch(() => {});
+                await page.waitForFunction(() => {
+                    const loader = document.querySelector('#wishlist-box #loader');
+                    if (!loader) return false;
+                    const style = getComputedStyle(loader);
+                    return style.display === 'none' || style.visibility === 'hidden' ||
+                        loader.getAttribute('aria-hidden') === 'true';
+                }, { timeout: ACTION_TIMEOUT_MS }).catch(() => {});
+                await page.waitForTimeout(1500);
             }
 
+            const found = await clearBtn.isVisible().catch(() => false);
             if (!found) {
-                await describeWishlist(page, 'final');
-                // If the site refused / failed the wishlist request, "empty" is NOT trustworthy.
-                const refused = slotApiDiagnostics.slice(-15).filter((l) => /wish/i.test(l) && (/ failed$/.test(l) || / [45]\d\d$/.test(l)));
-                if (refused.length > 0) {
-                    throw new Error(`The site refused the wishlist request (${refused[refused.length - 1]}), so the wishlist could not be checked.`);
+                await describeWishlist(page, 'final after component load');
+                const htmlState = await box.evaluate((el) => {
+                    const loader = el.querySelector('#loader');
+                    const app = el.querySelector('app-wishlist');
+                    const visible = (node) => !!node && node.getClientRects().length > 0 &&
+                        getComputedStyle(node).display !== 'none' &&
+                        getComputedStyle(node).visibility !== 'hidden';
+                    return {
+                        appPresent: !!app,
+                        loaderPresent: !!loader,
+                        loaderVisible: visible(loader),
+                        text: (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 500),
+                        itemControls: [...el.querySelectorAll('button')].filter(visible).map((b) => (b.innerText || '').trim())
+                    };
+                }).catch(() => null);
+
+                const refused = slotApiDiagnostics.slice(-20).filter((l) =>
+                    /wish|cart/i.test(l) && (/ failed$/.test(l) || / [45]\d\d$/.test(l)));
+                if (refused.length) {
+                    throw new Error(`The wishlist/cart request failed (${refused[refused.length - 1]}). Wishlist state is unknown; refusing to call it empty.`);
                 }
-                console.log('Wishlist is empty. Continuing.');
+                if (!htmlState || !htmlState.appPresent || !htmlState.loaderPresent || htmlState.loaderVisible) {
+                    throw new Error('Wishlist did not reach a verifiable loaded state. It may still be loading; refusing to report it empty.');
+                }
+                // Empty is accepted only after the Angular wishlist component exists,
+                // its loader is closed, and the page has settled after its data request.
+                console.log(`Wishlist verified empty (component loaded; loader hidden; visible controls: ${htmlState.itemControls.join(', ') || 'none'}).`);
                 return;
             }
 
-            // An item IS in the wishlist. The hook may decide to book it instead of clearing it.
+            console.log('⚠️ A wishlist item is present. Checking its slot before deciding whether to resume or clear it.');
             if (beforeClear) {
                 const handled = await beforeClear();
                 if (handled) return handled;
@@ -1059,8 +1091,8 @@ function createBot(botId) {
 
             await clearWishlistNow(page, clearBtn);
         } catch (err) {
-            if (!err.fromResume) console.log(`⚠️ Wishlist clear failed: ${err.message.split('\n')[0]}`);
-            throw err; // restarts the round so we never continue with a stale wishlist
+            if (!err.fromResume) console.log(`⚠️ Wishlist check/clear failed: ${err.message.split('\n')[0]}`);
+            throw err; // never continue booking while wishlist state is unknown
         }
     }
 
@@ -1483,36 +1515,57 @@ function createBot(botId) {
         }
     }
 
-    /** Opens the account menu and clicks "Pilgrim List" (the page only opens this way, not by address). */
+    /** Opens the account menu and waits for the Angular Pilgrim List table to render. */
     async function openPilgrimList(page, mark) {
-        if (!/pilgrimList/i.test(page.url())) {
+        const isListRoute = () => /#\/pilgrimList(?:[/?]|$)/i.test(page.url());
+        if (!isListRoute()) {
             mark('opening the account menu');
             const menu = page.locator('span.nav-link.logout-name').first();
-            await menu.waitFor({ state: 'attached', timeout: ACTION_TIMEOUT_MS });
+            await menu.waitFor({ state: 'visible', timeout: ACTION_TIMEOUT_MS });
             const item = page.locator('div[routerlink="/pilgrimList"]').first();
 
-            // The menu icon is an empty span, so a normal click can miss. Try three ways, checking each time
-            // that the "Pilgrim List" entry really appeared.
             let opened = false;
             for (let attempt = 1; attempt <= 3 && !opened; attempt++) {
                 try {
-                    if (attempt === 1) await clickOrForce(menu, 3000);
+                    if (attempt === 1) await clickOrForce(menu, 3500);
                     else if (attempt === 2) await menu.evaluate((el) => el.click());
                     else await menu.evaluate((el) => (el.parentElement || el).click());
-                } catch (e) { /* try the next way */ }
-                opened = await item.waitFor({ state: 'visible', timeout: 2500 }).then(() => true).catch(() => false);
-                if (!opened) console.log(`⚠️ "Pilgrim List" did not show after menu click ${attempt}/3.`);
+                } catch (e) { /* retry menu activation */ }
+                opened = await item.waitFor({ state: 'visible', timeout: 3000 }).then(() => true).catch(() => false);
+                if (!opened) console.log(`⚠️ Account menu did not expand on attempt ${attempt}/3.`);
             }
-            if (!opened && (await item.count()) === 0) throw new Error('The "Pilgrim List" entry never appeared in the account menu.');
+            if (!opened) throw new Error('Account menu did not expose the Pilgrim List option.');
 
             mark('clicking Pilgrim List');
-            await clickOrForce(item, 3500);
+            await clickOrForce(item, 4000);
             await waitForRoute(page, /pilgrimList/, ACTION_TIMEOUT_MS);
         }
-        mark('reading the Pilgrim List');
-        await page.waitForSelector('tr.mat-row, mat-row, tr.mat-mdc-row', { timeout: ACTION_TIMEOUT_MS });
-        await page.waitForLoadState('networkidle', { timeout: 4000 }).catch(() => {});
-        console.log('Opened the Pilgrim List page.');
+
+        mark('waiting for Pilgrim List table');
+        const rowSelector = '#table-wrapper tbody tr.mat-row:visible, mat-table mat-row:visible, tr.mat-mdc-row:visible';
+        const waitForRows = async (timeout) => page.waitForFunction((selector) => {
+            const rows = [...document.querySelectorAll(selector)];
+            return rows.some((row) => {
+                const style = getComputedStyle(row);
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                    row.getClientRects().length > 0 && (row.innerText || '').trim().length > 0;
+            });
+        }, rowSelector, { timeout });
+
+        try {
+            await page.waitForSelector('app-root', { state: 'attached', timeout: ACTION_TIMEOUT_MS });
+            await page.waitForSelector('.heading_pilmas', { state: 'visible', timeout: ACTION_TIMEOUT_MS });
+            await waitForRows(Math.min(ACTION_TIMEOUT_MS, 12000));
+        } catch (firstError) {
+            // Angular can enter the route before its API-backed table is populated.
+            // Reload the same permitted route once, then wait for the dynamic rows again.
+            console.log(`⚠️ Pilgrim List route loaded but rows are not ready yet. Refreshing the list once: ${firstError.message.split('\n')[0]}`);
+            await page.reload({ waitUntil: 'domcontentloaded' });
+            await waitForRoute(page, /pilgrimList/, ACTION_TIMEOUT_MS);
+            await page.waitForSelector('.heading_pilmas', { state: 'visible', timeout: ACTION_TIMEOUT_MS });
+            await waitForRows(ACTION_TIMEOUT_MS);
+        }
+        console.log(`Opened the Pilgrim List page. Visible rows: ${await page.locator(rowSelector).count()}.`);
     }
 
     /**
@@ -1523,7 +1576,7 @@ function createBot(botId) {
      * Returns a locator or null.
      */
     async function findPilgrimListRow(page, originalRow) {
-        const rows = page.locator('tr.mat-row, mat-row, tr.mat-mdc-row');
+        const rows = page.locator('#table-wrapper tbody tr.mat-row:visible, mat-table mat-row:visible, tr.mat-mdc-row:visible');
         const count = await rows.count();
         const texts = [];
         for (let i = 0; i < count; i++) texts.push(normalizeText(await rows.nth(i).innerText().catch(() => '')));
