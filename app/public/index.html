@@ -75,7 +75,7 @@ button.rm:disabled{opacity:.4;cursor:default}
 .note{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--go);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:13.5px;color:var(--mute)}
 </style></head><body>
 <header>
-<h1>Sabarimala booking console<small>Add as many bots as you need (type a name, press "+ Add bot"). Each bot has its own settings, console and isolated login, runs in the background and never stops until every pilgrim is booked (or you press Stop). <b>UI build: dynamic-bots v4 (low-memory)</b></small></h1>
+<h1>Sabarimala booking console<small>Add as many bots as you need (type a name, press "+ Add bot"). Each bot has its own settings, console and isolated login, runs in the background and never stops until every pilgrim is booked (or you press Stop). <b>UI build: dynamic-bots v4.1 (crash fix)</b></small></h1>
 <div id="sys" class="sys" title="Live server numbers"></div>
 <nav id="tabs" aria-label="Bots"></nav>
 </header>
@@ -276,7 +276,7 @@ function renderProgress(n,pr){
 }
 
 function showSys(s){if(!s)return;const low=s.freeMB<110;
- $('sys').innerHTML=`Memory <b>${s.usedMB} / ${s.limitMB} MB</b> used &middot; Browser sessions <b>${s.sessions} / ${s.maxSessions}</b>`+(s.waiting?` &middot; <span class="warn">${s.waiting} bot(s) waiting for a free slot</span>`:'')+(low?` &middot; <span class="warn">low memory</span>`:'')}
+ $('sys').innerHTML=`Memory <b>${s.usedMB} / ${s.limitMB} MB</b> used (server process ${s.nodeMB||'?'} MB) &middot; Browser sessions <b>${s.sessions} / ${s.maxSessions}</b>`+(s.waiting?` &middot; <span class="warn">${s.waiting} bot(s) waiting for a free slot</span>`:'')+(low?` &middot; <span class="warn">low memory</span>`:'')}
 botList=loadList();
 botList.forEach(b=>addBotUI(b.id,b.name,false));
 const es=new EventSource('/api/events');
